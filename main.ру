@@ -1,0 +1,348 @@
+
+import os
+import time
+import sqlite3
+import logging
+import requests
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+SYMBOL = "BTCUSDT"
+DB = "vexora.db"
+DURATION = 300
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("VEXORA")
+
+
+def database():
+    return sqlite3.connect(DB)
+
+
+def init_db():
+    with database() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT,
+                entry REAL,
+                created REAL,
+                result TEXT DEFAULT 'PENDING'
+            )
+        """)
+
+
+def get_users():
+    with database() as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT chat_id FROM users"
+        ).fetchall()]
+
+
+def get_market():
+    response = requests.get(
+        "https://api.binance.com/api/v3/klines",
+        params={
+            "symbol": SYMBOL,
+            "interval": "1m",
+            "limit": 100
+        },
+        timeout=10
+    )
+    response.raise_for_status()
+
+    candles = response.json()
+    closes = [float(c[4]) for c in candles[:-1]]
+
+    return closes
+
+
+def ema(values, period):
+    alpha = 2 / (period + 1)
+    result = values[0]
+
+    for value in values[1:]:
+        result = alpha * value + (1 - alpha) * result
+
+    return result
+
+
+def rsi(values, period=14):
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
+    recent = changes[-period:]
+    gains = [max(x, 0) for x in recent]
+    losses = [abs(min(x, 0)) for x in recent]
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def analyze():
+    prices = get_market()
+
+    if len(prices) < 50:
+        return None
+
+    fast = ema(prices[-30:], 9)
+    slow = ema(prices[-50:], 21)
+    strength = rsi(prices)
+
+    direction = None
+
+    if fast > slow and 52 <= strength <= 68:
+        direction = "UP"
+
+    elif fast < slow and 32 <= strength <= 48:
+        direction = "DOWN"
+
+    return {
+        "direction": direction,
+        "price": prices[-1],
+        "rsi": strength
+    }
+
+
+def create_signal(direction, price):
+    with database() as conn:
+        conn.execute("""
+            INSERT INTO signals(direction, entry, created)
+            VALUES (?, ?, ?)
+        """, (direction, price, time.time()))
+
+
+def settle_signals(price):
+    now = time.time()
+
+    with database() as conn:
+        pending = conn.execute("""
+            SELECT id, direction, entry
+            FROM signals
+            WHERE result = 'PENDING'
+        """).fetchall()
+
+        for signal_id, direction, entry in pending:
+            # Срок виртуального прогноза — 5 минут.
+            row = conn.execute(
+                "SELECT created FROM signals WHERE id = ?",
+                (signal_id,)
+            ).fetchone()
+
+            if not row or now - row[0] < DURATION:
+                continue
+
+            if price == entry:
+                result = "DRAW"
+            elif direction == "UP":
+                result = "WIN" if price > entry else "LOSS"
+            else:
+                result = "WIN" if price < entry else "LOSS"
+
+            conn.execute("""
+                UPDATE signals
+                SET result = ?
+                WHERE id = ?
+            """, (result, signal_id))
+
+
+def stats():
+    with database() as conn:
+        wins = conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE result='WIN'"
+        ).fetchone()[0]
+
+        losses = conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE result='LOSS'"
+        ).fetchone()[0]
+
+        draws = conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE result='DRAW'"
+        ).fetchone()[0]
+
+    total = wins + losses
+    accuracy = wins / total * 100 if total else 0
+
+    return wins, losses, draws, accuracy
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    with database() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users VALUES (?)",
+            (chat_id,)
+        )
+
+    await update.message.reply_text(
+        "🚀 Добро пожаловать в VEXORA SIGNALS!\n\n"
+        "📡 Анализ BTC/USDT\n"
+        "📊 Статистика виртуальных прогнозов\n\n"
+        "/signal — анализ рынка\n"
+        "/stats — статистика\n"
+        "/subscribe — включить уведомления\n"
+        "/unsubscribe — отключить уведомления\n\n"
+        "Режим: виртуальный. Реальные сделки не выполняются."
+    )
+
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = analyze()
+
+        if not data:
+            await update.message.reply_text("Недостаточно данных.")
+            return
+
+        if not data["direction"]:
+            await update.message.reply_text(
+                "🔎 Сигнала пока нет.\n"
+                f"BTC/USDT: {data['price']:.2f}\n"
+                f"RSI: {data['rsi']:.1f}"
+            )
+            return
+
+        create_signal(data["direction"], data["price"])
+
+        await update.message.reply_text(
+            "📡 VEXORA SIGNAL\n\n"
+            f"Актив: {SYMBOL}\n"
+            f"Направление: {data['direction']}\n"
+            f"Цена наблюдения: {data['price']:.2f}\n"
+            f"RSI: {data['rsi']:.1f}\n"
+            "Срок виртуальной проверки: 5 минут\n\n"
+            "⚠️ Учебный виртуальный сигнал."
+        )
+
+    except Exception:
+        log.exception("Signal error")
+        await update.message.reply_text(
+            "Не удалось получить данные рынка."
+        )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wins, losses, draws, accuracy = stats()
+
+    await update.message.reply_text(
+        "📊 VEXORA STATISTICS\n\n"
+        f"✅ Победы: {wins}\n"
+        f"❌ Поражения: {losses}\n"
+        f"➖ Ничьи: {draws}\n"
+        f"🎯 Процент побед: {accuracy:.1f}%\n\n"
+        "Статистика основана на виртуальных прогнозах."
+    )
+
+
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with database() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users VALUES (?)",
+            (update.effective_chat.id,)
+        )
+
+    await update.message.reply_text("🔔 Уведомления включены.")
+
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with database() as conn:
+        conn.execute(
+            "DELETE FROM users WHERE chat_id = ?",
+            (update.effective_chat.id,)
+        )
+
+    await update.message.reply_text("🔕 Уведомления отключены.")
+
+
+async def monitor(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = analyze()
+
+        if not data:
+            return
+
+        price = data["price"]
+        settle_signals(price)
+
+        if not data["direction"]:
+            return
+
+        with database() as conn:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE result='PENDING'"
+            ).fetchone()[0]
+
+        if pending:
+            return
+
+        create_signal(data["direction"], price)
+
+        message = (
+            "📡 VEXORA SIGNAL\n\n"
+            f"Актив: {SYMBOL}\n"
+            f"Направление: {data['direction']}\n"
+            f"Цена: {price:.2f}\n"
+            f"RSI: {data['rsi']:.1f}\n"
+            "Срок: 5 минут\n\n"
+            "Виртуальный прогноз."
+        )
+
+        for chat_id in get_users():
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message
+                )
+            except Exception:
+                log.exception("Message delivery failed")
+
+    except Exception:
+        log.exception("Monitor error")
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан!")
+
+    init_db()
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", signal_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+
+    app.job_queue.run_repeating(
+        monitor,
+        interval=60,
+        first=15
+    )
+
+    log.info("VEXORA started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
